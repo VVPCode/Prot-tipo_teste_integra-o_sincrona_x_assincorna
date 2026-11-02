@@ -1,0 +1,150 @@
+# Ambiente do experimento (secao 3.2.2 do artigo).
+# Cinco componentes: produtor, consumidor, RabbitMQ, PostgreSQL e o gerador de
+# carga, este executado em processo apartado pelo script de execucao. Cada
+# conteiner tem limites fixos de CPU e memoria, de modo que a capacidade
+# disponivel seja identica nas duas condicoes.
+name: exp-integracao
+
+services:
+  rabbitmq:
+    image: ${IMAGEM_RABBITMQ:-rabbitmq:4.3.6-management}
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USUARIO:-exp}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_SENHA:-exp}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      # check_port_connectivity confere os ouvintes: o ping responde assim que o
+      # no Erlang sobe, antes de a porta 5672 aceitar conexoes, e os servicos
+      # encerravam com "connection refused" na primeira subida do ambiente.
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 3s
+      timeout: 10s
+      retries: 40
+    deploy:
+      resources:
+        limits:
+          cpus: "${CPU_BROKER:-2.0}"
+          memory: ${MEM_BROKER:-1g}
+
+  # Banco exclusivo do servico consumidor (Richardson, 2018; secao 3.2).
+  # Durabilidade padrao: fsync e synchronous_commit ligados, como registrado nos
+  # metadados de cada execucao.
+  postgres:
+    image: ${IMAGEM_POSTGRES:-postgres:18.6}
+    hostname: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USUARIO:-exp}
+      POSTGRES_PASSWORD: ${POSTGRES_SENHA:-exp}
+      POSTGRES_DB: ${POSTGRES_BANCO:-exp}
+    # O esquema e carregado na primeira subida. Como o protocolo reinicia o
+    # ambiente com "down -v" antes de cada cenario, as tabelas partem vazias.
+    volumes:
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      # Por TCP e com a tabela consultada: durante a inicializacao o Postgres
+      # atende somente no socket unix e o esquema ainda nao foi carregado, de
+      # modo que um pg_isready local marcaria o servico como saudavel antes de
+      # ele poder receber gravacoes.
+      test:
+        - CMD-SHELL
+        - >-
+          PGPASSWORD=$$POSTGRES_PASSWORD pg_isready -q -h 127.0.0.1
+          -U $$POSTGRES_USER -d $$POSTGRES_DB &&
+          PGPASSWORD=$$POSTGRES_PASSWORD psql -q -h 127.0.0.1
+          -U $$POSTGRES_USER -d $$POSTGRES_DB -tAc 'select 1 from pedidos limit 1'
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    deploy:
+      resources:
+        limits:
+          cpus: "${CPU_POSTGRES:-1.0}"
+          memory: ${MEM_POSTGRES:-1g}
+
+  produtor:
+    build:
+      context: .
+      dockerfile: services/produtor/Dockerfile
+    image: exp-integracao/produtor
+    environment:
+      CONSUMIDOR_URL: http://consumidor:8001
+      AMQP_URL: amqp://${RABBITMQ_USUARIO:-exp}:${RABBITMQ_SENHA:-exp}@rabbitmq:5672/%2F
+      TEMPO_PROCESSAMENTO_MS: ${TEMPO_PROCESSAMENTO_MS:-50}
+      TEMPO_CPU_MS: ${TEMPO_CPU_MS:-0}
+      CONCORRENCIA: ${CONCORRENCIA:-8}
+      POOL_BANCO: ${POOL_BANCO:-8}
+      TEMPO_LIMITE_MS: ${TEMPO_LIMITE_MS:-1000}
+      MENSAGEM_PERSISTENTE: ${MENSAGEM_PERSISTENTE:-1}
+      MODO: ${MODO:-sincrono}
+      EXECUCAO_ID: ${EXECUCAO_ID:-avulsa}
+      CENARIO: ${CENARIO:-NA}
+      REPETICAO: ${REPETICAO:-0}
+      TAMANHO_MENSAGEM: ${TAMANHO_MENSAGEM:-500}
+      BACKLOG: ${BACKLOG:-2048}
+      DIR_RESULTADOS: /resultados
+      WORKERS: ${WORKERS_PRODUTOR:-4}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./resultados:/resultados
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      consumidor:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/saude')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "${CPU_PRODUTOR:-4.0}"
+          memory: ${MEM_SERVICO:-512m}
+
+  consumidor:
+    build:
+      context: .
+      dockerfile: services/consumidor/Dockerfile
+    image: exp-integracao/consumidor
+    environment:
+      AMQP_URL: amqp://${RABBITMQ_USUARIO:-exp}:${RABBITMQ_SENHA:-exp}@rabbitmq:5672/%2F
+      POSTGRES_DSN: postgresql://${POSTGRES_USUARIO:-exp}:${POSTGRES_SENHA:-exp}@postgres:5432/${POSTGRES_BANCO:-exp}
+      TEMPO_PROCESSAMENTO_MS: ${TEMPO_PROCESSAMENTO_MS:-50}
+      TEMPO_CPU_MS: ${TEMPO_CPU_MS:-0}
+      CONCORRENCIA: ${CONCORRENCIA:-8}
+      POOL_BANCO: ${POOL_BANCO:-8}
+      TEMPO_LIMITE_MS: ${TEMPO_LIMITE_MS:-1000}
+      MENSAGEM_PERSISTENTE: ${MENSAGEM_PERSISTENTE:-1}
+      MODO: ${MODO:-sincrono}
+      EXECUCAO_ID: ${EXECUCAO_ID:-avulsa}
+      CENARIO: ${CENARIO:-NA}
+      REPETICAO: ${REPETICAO:-0}
+      TAMANHO_MENSAGEM: ${TAMANHO_MENSAGEM:-500}
+      BACKLOG: ${BACKLOG:-2048}
+      DIR_RESULTADOS: /resultados
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./resultados:/resultados
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8001/saude')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "${CPU_SERVICO:-1.0}"
+          memory: ${MEM_SERVICO:-512m}
